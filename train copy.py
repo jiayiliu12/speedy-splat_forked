@@ -17,14 +17,17 @@ from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
-from utils.image_utils import psnr
 import uuid
 from tqdm import tqdm
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    TENSORBOARD_FOUND = True
+except ImportError:
+    TENSORBOARD_FOUND = False
+
 from compute_scene_metrics import scene_metrics
-import wandb
-import random
 
 def score_func(view, gaussians, pipeline, background, scores):
 
@@ -43,22 +46,18 @@ def score_func(view, gaussians, pipeline, background, scores):
 
 def prune(scene, gaussians, pipe, background, prune_ratio):
 
-    start_prune = torch.cuda.Event(enable_timing = True)
-    end_prune = torch.cuda.Event(enable_timing = True)
+    iter_start = torch.cuda.Event(enable_timing = True)
+    iter_end = torch.cuda.Event(enable_timing = True)
     torch.cuda.reset_peak_memory_stats()
 
-    start_prune.record()
+    iter_start.record()
 
     with torch.enable_grad():
         pbar = tqdm(
             total=len(scene.getTrainCameras()),
             desc='Computing Pruning Scores')
-        scores = torch.zeros_like(gaussians.get_opacity) # one score for each Gaussian in the model!
-
-        random_list = random.sample(range(0, len(scene.getTrainCameras()) - 1), int(len(scene.getTrainCameras()) * 0.1)) # sample() samples without replacement! (only unique numbers in list)
-
-        for i, view in enumerate(scene.getTrainCameras()): # TODO: Maybe random sample views?? Whats the quality after this change??
-            # if i in random_list:
+        scores = torch.zeros_like(gaussians.get_opacity)
+        for view in scene.getTrainCameras():
             score_func(view, gaussians, pipe, background,
                 scores)
             pbar.update(1)
@@ -66,36 +65,23 @@ def prune(scene, gaussians, pipe, background, prune_ratio):
 
     gaussians.prune_gaussians(prune_ratio, scores)
 
-    end_prune.record()
-    
+    iter_end.record()
+
     # Track peak memory usage (in bytes) and convert to MB
     peak_memory_allocated = torch.cuda.max_memory_allocated() / (1024 ** 2)
     peak_memory_reserved = torch.cuda.max_memory_reserved() / (1024 ** 2)
-    pruning_time_ms = start_prune.elapsed_time(end_prune)
-    # time_min = time_ms / 60_000
+    time_ms = iter_start.elapsed_time(iter_end)
+    time_min = time_ms / 60_000
 
     return {
         "peak_memory_allocated" : peak_memory_allocated,
         "peak_memory_reserved" : peak_memory_reserved,
-        "time_ms" : pruning_time_ms
+        "time_min" : time_min
     }
 
 def training(dataset, opt, pipe, testing_iterations, visualize_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
-    
-    wandb.init(project="Speedy-Splat", config={**vars(dataset),**vars(opt)})
-    start_whole = torch.cuda.Event(enable_timing=True)
-    end_whole = torch.cuda.Event(enable_timing=True)
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start_render = torch.cuda.Event(enable_timing=True)
-    end_render = torch.cuda.Event(enable_timing=True)
-    start_backward = torch.cuda.Event(enable_timing=True)
-    end_backward = torch.cuda.Event(enable_timing=True)
-    start_dens = torch.cuda.Event(enable_timing=True)
-    end_dens = torch.cuda.Event(enable_timing=True)
-
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
@@ -107,7 +93,10 @@ def training(dataset, opt, pipe, testing_iterations, visualize_iterations, savin
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
     train_time_ms = 0
+    iter_start = torch.cuda.Event(enable_timing = True)
+    iter_end = torch.cuda.Event(enable_timing = True)
 
+    prune_time_min = 0
     prune_peak_memory_allocated = 0
     prune_peak_memory_reserved = 0
 
@@ -115,7 +104,6 @@ def training(dataset, opt, pipe, testing_iterations, visualize_iterations, savin
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
-
     for iteration in range(first_iter, opt.iterations + 1):
         if network_gui.conn == None:
             network_gui.try_connect()
@@ -131,12 +119,8 @@ def training(dataset, opt, pipe, testing_iterations, visualize_iterations, savin
                     break
             except Exception as e:
                 network_gui.conn = None
-
         torch.cuda.reset_peak_memory_stats()
-
-        prune_time_ms = 0
-
-        start_whole.record()
+        iter_start.record()
 
         gaussians.update_learning_rate(iteration)
 
@@ -152,22 +136,20 @@ def training(dataset, opt, pipe, testing_iterations, visualize_iterations, savin
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
-        start.record()
-        start_render.record()
         render_pkg = render(viewpoint_cam, gaussians, pipe, background)
-        end_render.record()
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
-
-        start_backward.record()
         loss.backward()
-        end_backward.record()
 
-        end.record()
+        iter_end.record()
+        # Track peak memory usage (in bytes) and convert to MB
+        peak_memory_allocated = torch.cuda.max_memory_allocated() / (1024 ** 2)
+        peak_memory_reserved = torch.cuda.max_memory_reserved() / (1024 ** 2)
+
 
         with torch.no_grad():
 
@@ -183,9 +165,8 @@ def training(dataset, opt, pipe, testing_iterations, visualize_iterations, savin
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
+            # Densification
             if iteration < opt.densify_until_iter:
-                # Densification
-                start_dens.record()
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
@@ -193,7 +174,6 @@ def training(dataset, opt, pipe, testing_iterations, visualize_iterations, savin
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
-                end_dens.record()
 
                 # --- Soft Pruning ---
                 if (iteration >= opt.prune_from_iter) and \
@@ -203,7 +183,7 @@ def training(dataset, opt, pipe, testing_iterations, visualize_iterations, savin
                     prune_pkg = prune(
                         scene, gaussians, pipe, background,
                         opt.densify_prune_ratio)
-                    prune_time_ms += prune_pkg['time_ms']
+                    prune_time_min += prune_pkg['time_min']
                     prune_peak_memory_allocated = prune_pkg['peak_memory_allocated']
                     prune_peak_memory_reserved = prune_pkg['peak_memory_reserved']
 
@@ -228,44 +208,21 @@ def training(dataset, opt, pipe, testing_iterations, visualize_iterations, savin
                 prune_pkg = prune(
                     scene, gaussians, pipe, background,
                     opt.after_densify_prune_ratio)
-                # sys.exit("We've finished pruning!")
-                prune_time_ms += prune_pkg['time_ms']
+                prune_time_min += prune_pkg['time_min']
                 prune_peak_memory_allocated = prune_pkg['peak_memory_allocated']
                 prune_peak_memory_reserved = prune_pkg['peak_memory_reserved']
 
-            end_whole.record()
-
-            end_whole.synchronize()   # <---- required for correct forward timing
 
             # Log and save
-            time_whole = start_whole.elapsed_time(end_whole)
-            time = start.elapsed_time(end)
-            time_render = start_render.elapsed_time(end_render)
-            time_bwd = start_backward.elapsed_time(end_backward)
-            time_dens = start_dens.elapsed_time(end_dens)
-
-            # add densification time and prune time together
-            time_dens += prune_time_ms
-
-            train_time_ms += time
-
-            wandb.log({
-                "train/total_loss": loss.item(),
-                "train/L1": Ll1.item(),
-                "gaussians/count": scene.gaussians.get_xyz.shape[0],
-                "time/total_iteration [ms]": time_whole,
-                "time/render [ms]": time_render,
-                "time/backward [ms]": time_bwd,
-                # "time/render/rasterize_forward [ms]": elapsed_times["GaussiansRasterFunc_time"],
-                "time/densification_pruning" : time_dens,
-                "time/train_accumulated [ms]": train_time_ms,
-            }, iteration)
+            iter_time = iter_start.elapsed_time(iter_end)
+            train_time_ms += iter_time
+            train_time_min = train_time_ms / 60_000
 
             training_report(
-                tb_writer, iteration,
-                time_whole,
-                time, time_render, time_bwd, train_time_ms, prune_time_ms, time_dens,
+                tb_writer, iteration, Ll1, loss,
+                iter_time, train_time_min, prune_time_min,
                 testing_iterations, visualize_iterations,
+                peak_memory_allocated, peak_memory_reserved,
                 prune_peak_memory_allocated, prune_peak_memory_reserved,
                 scene, render,
                 (pipe, background))
@@ -291,15 +248,29 @@ def prepare_output_and_logger(args):
         tb_writer = SummaryWriter(args.model_path)
     else:
         print("Tensorboard not available: not logging progress")
-    return None
+    return tb_writer
 
 def training_report(
-        tb_writer, iteration,
-        time_whole,
-        time, render_time, backward_time, train_time, prune_time, time_dens,
+        tb_writer, iteration, Ll1, loss,
+        iter_time, train_time, prune_time,
         testing_iterations, visualize_iterations,
+        peak_memory_allocated, peak_memory_reserved,
         prune_peak_memory_allocated, prune_peak_memory_reserved,
         scene : Scene, renderFunc, renderArgs):
+
+    if tb_writer:
+        tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
+        tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
+        tb_writer.add_scalar('time/iter_time', iter_time, iteration)
+        tb_writer.add_scalar('time/train_time_minutes', train_time, iteration)
+        tb_writer.add_scalar('time/prune_time_minutes', prune_time, iteration)
+        tb_writer.add_scalar('counts/total_points', scene.gaussians.get_xyz.shape[0], iteration)
+        tb_writer.add_scalar('memory/peak_allocated_MB', peak_memory_allocated, iteration)
+        tb_writer.add_scalar('memory/peak_reserved_MB', peak_memory_reserved, iteration)
+        if prune_peak_memory_allocated > 0:
+            tb_writer.add_scalar('memory/prune_peak_allocated_MB', prune_peak_memory_allocated, iteration)
+        if prune_peak_memory_reserved > 0:
+            tb_writer.add_scalar('memory/prune_peak_reserved_MB', prune_peak_memory_reserved, iteration)
 
     # Report test and samples of training set
     if iteration in testing_iterations:
@@ -308,8 +279,8 @@ def training_report(
             iteration, train_time))
 
         validation_configs = (
-            {'name': 'Testset', 'cameras' : scene.getTestCameras()},
-            {'name': 'Trainingset', 'cameras' : [
+            {'name': 'test', 'cameras' : scene.getTestCameras()},
+            {'name': 'train', 'cameras' : [
                 scene.getTrainCameras()[idx % len(scene.getTrainCameras())]
                 for idx in range(5, 30, 5)] }
         )
@@ -319,12 +290,6 @@ def training_report(
             if cameras and len(cameras) > 0:
                 metrics = scene_metrics(iteration, name, cameras,
                     scene, renderFunc, renderArgs)
-                wandb.log({f"test/l1_loss_{name}" : metrics[0],
-                           f"test/psnr_{name}" :  metrics[1],
-                           f"test/ssim_{name}" : metrics[2],
-                           f"test/LPIPS_{name}": metrics[3],
-                           f"time/inference_{name} [ms]": metrics[4]*1000
-                }, step=iteration)
                 if tb_writer:
                     tb_writer.add_scalar(
                         f'metrics_{name}/L1 Loss', metrics[0], iteration)
@@ -337,12 +302,10 @@ def training_report(
                     tb_writer.add_scalar(
                         f'metrics_{name}/FPS', metrics[4], iteration)
 
-    wandb_images = {}
-
     if (iteration in visualize_iterations) and tb_writer:
         validation_configs = (
-            {'name': 'Testset', 'cameras' : scene.getTestCameras()},
-            {'name': 'Trainingset', 'cameras' : [
+            {'name': 'test', 'cameras' : scene.getTestCameras()},
+            {'name': 'train', 'cameras' : [
                 scene.getTrainCameras()[idx % len(scene.getTrainCameras())]
                 for idx in range(5, 30, 5)] }
         )
@@ -379,8 +342,8 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=list(range(1000, 31000, 1000)))# 500 1000 1500 2000 2500 3000 3500 4000 4500 5000 5500 6000 6500 7000 7500 8000 8500 9000 9500 10000 ])
-    parser.add_argument("--visualize_iterations", nargs="+", type=int, default=list(range(1000, 31000, 1000)))
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 15_000, 30_000])
+    parser.add_argument("--visualize_iterations", nargs="+", type=int, default=[7_000, 15_000, 30_000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])

@@ -1,8 +1,8 @@
-data_path=$SCENE_DATA_PATH
-model_path=$SCENE_MODEL_PATH
+data_path="/users/ljiayi/data/truck"
+model_path="/users/ljiayi/speedy-splat_forked/output/wandb_truck_new_pruning"
 
-python train.py \
+python /users/ljiayi/speedy-splat_forked/train.py \
   -s ${data_path} \
   -m ${model_path} \
-  --eval
-
+  --eval \
+  --iterations 30000
