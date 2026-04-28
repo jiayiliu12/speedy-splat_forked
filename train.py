@@ -11,6 +11,7 @@
 
 import os
 import torch
+import numpy as np
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
@@ -72,7 +73,6 @@ def prune(scene, gaussians, pipe, background, prune_ratio):
     peak_memory_allocated = torch.cuda.max_memory_allocated() / (1024 ** 2)
     peak_memory_reserved = torch.cuda.max_memory_reserved() / (1024 ** 2)
     pruning_time_ms = start_prune.elapsed_time(end_prune)
-    # time_min = time_ms / 60_000
 
     return {
         "peak_memory_allocated" : peak_memory_allocated,
@@ -85,6 +85,8 @@ def training(dataset, opt, pipe, testing_iterations, visualize_iterations, savin
     tb_writer = prepare_output_and_logger(dataset)
     
     wandb.init(project="Speedy-Splat", config={**vars(dataset),**vars(opt)})
+
+    # CUDA timing events
     start_whole = torch.cuda.Event(enable_timing=True)
     end_whole = torch.cuda.Event(enable_timing=True)
     start = torch.cuda.Event(enable_timing=True)
@@ -111,6 +113,14 @@ def training(dataset, opt, pipe, testing_iterations, visualize_iterations, savin
     prune_peak_memory_allocated = 0
     prune_peak_memory_reserved = 0
 
+    # --- Benchmark accumulators (mirrors LiteGS) ---
+    # _all_iter_ms tracks pure render+loss+backward time, excluding densification
+    # and testing — so it measures the same quantity as LiteGS's per-iter timer.
+    _WARMUP_ITERS = min(100, max(10, opt.iterations // 300))
+    _all_iter_ms: list[float] = []
+    _all_densify_ms: list[float] = []
+    # ------------------------------------------------
+
     viewpoint_stack = None
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
@@ -133,8 +143,6 @@ def training(dataset, opt, pipe, testing_iterations, visualize_iterations, savin
                 network_gui.conn = None
 
         torch.cuda.reset_peak_memory_stats()
-
-        prune_time_ms = 0
 
         start_whole.record()
 
@@ -169,9 +177,19 @@ def training(dataset, opt, pipe, testing_iterations, visualize_iterations, savin
 
         end.record()
 
+        # ---------------------------------------------------------------
+        # Everything below is torch.no_grad. Order matches LiteGS:
+        #   1. progress bar / saving
+        #   2. optimizer step
+        #   3. compute pure training timings  <- no densification yet
+        #   4. wandb log (training metrics)   <- clean measurement
+        #   5. training_report / evaluation   <- clean measurement
+        #   6. densification + pruning
+        #   7. wandb log (densification + total-with-pruning timing)
+        # ---------------------------------------------------------------
         with torch.no_grad():
 
-            # Progress bar
+            # 1. Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
@@ -179,12 +197,51 @@ def training(dataset, opt, pipe, testing_iterations, visualize_iterations, savin
             if iteration == opt.iterations:
                 progress_bar.close()
 
-            if (iteration in saving_iterations):
+            if iteration in saving_iterations:
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
+            # 2. Optimizer step (before densification, matching LiteGS order)
+            if iteration < opt.iterations:
+                gaussians.optimizer.step()
+                gaussians.optimizer.zero_grad(set_to_none=True)
+
+            if iteration in checkpoint_iterations:
+                print("\n[ITER {}] Saving Checkpoint".format(iteration))
+                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+
+            # 3. Compute pure training timings (render + loss + backward only).
+            #    elapsed_time() blocks until both events are recorded, so no
+            #    explicit synchronize is needed here.
+            time = start.elapsed_time(end)
+            time_render = start_render.elapsed_time(end_render)
+            time_bwd = start_backward.elapsed_time(end_backward)
+            train_time_ms += time
+            _all_iter_ms.append(time)
+
+            # 4. Log pure training metrics — densification has NOT run yet,
+            #    so these numbers reflect only the actual training kernel.
+            wandb.log({
+                "train/total_loss": loss.item(),
+                "train/L1": Ll1.item(),
+                "gaussians/count": scene.gaussians.get_xyz.shape[0],
+                "time/render [ms]": time_render,
+                "time/backward [ms]": time_bwd,
+                "time/total_iteration [ms]": time,
+                "time/train_accumulated [ms]": train_time_ms,
+            }, iteration)
+
+            # 5. Evaluation / visualisation — before densification (mirrors LiteGS)
+            training_report(
+                tb_writer, iteration,
+                train_time_ms,
+                testing_iterations, visualize_iterations,
+                scene, render, (pipe, background), is_final=(iteration == opt.iterations))
+
+            # 6. Densification + pruning
+            prune_time_ms = 0
+
             if iteration < opt.densify_until_iter:
-                # Densification
                 start_dens.record()
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
@@ -210,15 +267,6 @@ def training(dataset, opt, pipe, testing_iterations, visualize_iterations, savin
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
-            # Optimizer step
-            if iteration < opt.iterations:
-                gaussians.optimizer.step()
-                gaussians.optimizer.zero_grad(set_to_none = True)
-
-            if (iteration in checkpoint_iterations):
-                print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
-
             # --- Hard Pruning ---
             if (iteration >= opt.densify_until_iter) and \
                 (iteration >= opt.prune_from_iter) and \
@@ -228,47 +276,67 @@ def training(dataset, opt, pipe, testing_iterations, visualize_iterations, savin
                 prune_pkg = prune(
                     scene, gaussians, pipe, background,
                     opt.after_densify_prune_ratio)
-                # sys.exit("We've finished pruning!")
                 prune_time_ms += prune_pkg['time_ms']
                 prune_peak_memory_allocated = prune_pkg['peak_memory_allocated']
                 prune_peak_memory_reserved = prune_pkg['peak_memory_reserved']
 
+            # end_whole covers the full iteration including densification
             end_whole.record()
+            end_whole.synchronize()
 
-            end_whole.synchronize()   # <---- required for correct forward timing
-
-            # Log and save
+            # 7. Densification timing logged separately — training metrics above
+            #    are already committed and stay uncontaminated.
             time_whole = start_whole.elapsed_time(end_whole)
-            time = start.elapsed_time(end)
-            time_render = start_render.elapsed_time(end_render)
-            time_bwd = start_backward.elapsed_time(end_backward)
-            time_dens = start_dens.elapsed_time(end_dens)
+            time_dens = start_dens.elapsed_time(end_dens) + prune_time_ms
 
-            # add densification time and prune time together
-            time_dens += prune_time_ms
-
-            train_time_ms += time
+            if time_dens > 0:
+                _all_densify_ms.append(time_dens)
 
             wandb.log({
-                "train/total_loss": loss.item(),
-                "train/L1": Ll1.item(),
-                "gaussians/count": scene.gaussians.get_xyz.shape[0],
-                "time/total_iteration [ms]": time_whole,
-                "time/render [ms]": time_render,
-                "time/backward [ms]": time_bwd,
-                # "time/render/rasterize_forward [ms]": elapsed_times["GaussiansRasterFunc_time"],
-                "time/densification_pruning" : time_dens,
-                "time/train_accumulated [ms]": train_time_ms,
+                "time/densification_pruning [ms]": time_dens,
+                "time/total_iteration_with_pruning [ms]": time_whole,
             }, iteration)
 
-            training_report(
-                tb_writer, iteration,
-                time_whole,
-                time, time_render, time_bwd, train_time_ms, prune_time_ms, time_dens,
-                testing_iterations, visualize_iterations,
-                prune_peak_memory_allocated, prune_peak_memory_reserved,
-                scene, render,
-                (pipe, background))
+    # --- Benchmark Summary (mirrors LiteGS) ---
+    _bench_iters = (
+        np.array(_all_iter_ms[_WARMUP_ITERS:])
+        if len(_all_iter_ms) > _WARMUP_ITERS
+        else np.array(_all_iter_ms)
+    )
+    _densify_arr = np.array(_all_densify_ms) if _all_densify_ms else np.zeros(1)
+    _total_iter_s    = np.array(_all_iter_ms).sum() / 1000
+    _total_densify_s = _densify_arr.sum() / 1000
+
+    _gpu_name = torch.cuda.get_device_name(0)
+    _bench_scalars = {
+        "benchmark/iter_mean_ms":         float(np.mean(_bench_iters)),
+        "benchmark/iter_median_ms":       float(np.median(_bench_iters)),
+        "benchmark/iter_std_ms":          float(np.std(_bench_iters)),
+        "benchmark/densify_mean_ms":      float(np.mean(_densify_arr)),
+        "benchmark/densify_total_s":      round(_total_densify_s, 3),
+        "benchmark/total_training_s":     round(_total_iter_s, 3),
+        "benchmark/total_with_densify_s": round(_total_iter_s + _total_densify_s, 3),
+    }
+    wandb.log({
+        **_bench_scalars,
+        "benchmark/iter_time_histogram":    wandb.Histogram(np.array(_bench_iters)),
+        "benchmark/densify_time_histogram": wandb.Histogram(_densify_arr),
+    })
+    wandb.summary.update({
+        "benchmark/gpu":            _gpu_name,
+        "benchmark/warmup_iters":   _WARMUP_ITERS,
+        "benchmark/measured_iters": len(_bench_iters),
+        **_bench_scalars,
+    })
+    print("\n=== Training Benchmark ===")
+    print(f"  GPU:            {_gpu_name}")
+    print(f"  Iters measured: {len(_bench_iters):,}  (excl. {_WARMUP_ITERS} warmup)")
+    print(f"  Iter time:      mean {np.mean(_bench_iters):.2f} ms  |  median {np.median(_bench_iters):.2f} ms  |  std {np.std(_bench_iters):.2f} ms")
+    print(f"  Densification:  mean {np.mean(_densify_arr):.2f} ms  |  total {_total_densify_s:.2f} s  ({len(_all_densify_ms)} steps)")
+    print(f"  Pure training:  {_total_iter_s:.1f} s")
+    print(f"  Incl. densify:  {_total_iter_s + _total_densify_s:.1f} s")
+    print("==========================\n")
+    # ------------------------------------------
 
 
 def prepare_output_and_logger(args):
@@ -287,84 +355,107 @@ def prepare_output_and_logger(args):
 
     # Create Tensorboard writer
     tb_writer = None
-    if TENSORBOARD_FOUND:
-        tb_writer = SummaryWriter(args.model_path)
-    else:
-        print("Tensorboard not available: not logging progress")
-    return None
+    # if TENSORBOARD_FOUND:
+    #     tb_writer = SummaryWriter(args.model_path)
+    # else:
+    #     print("Tensorboard not available: not logging progress")
+    return tb_writer
+
 
 def training_report(
         tb_writer, iteration,
-        time_whole,
-        time, render_time, backward_time, train_time, prune_time, time_dens,
+        train_time_ms,
         testing_iterations, visualize_iterations,
-        prune_peak_memory_allocated, prune_peak_memory_reserved,
-        scene : Scene, renderFunc, renderArgs):
+        scene: Scene, renderFunc, renderArgs, is_final):
+    """Evaluate on test/train cameras and log quality metrics.
 
-    # Report test and samples of training set
+    Timing parameters for densification/pruning have been removed — those are
+    logged separately in the main loop AFTER densification runs, keeping this
+    function's output uncontaminated by densification overhead.
+    """
+
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
-        print("\n[ITER {}] Training Time: {} minutes".format(
-            iteration, train_time))
+        print("\n[ITER {}] Training Time: {:.1f} minutes".format(
+            iteration, train_time_ms / 60_000))
 
         validation_configs = (
-            {'name': 'Testset', 'cameras' : scene.getTestCameras()},
-            {'name': 'Trainingset', 'cameras' : [
+            {'name': 'Testset',     'cameras': scene.getTestCameras()},
+            {'name': 'Trainingset', 'cameras': [
                 scene.getTrainCameras()[idx % len(scene.getTrainCameras())]
-                for idx in range(5, 30, 5)] }
+                for idx in range(5, 30, 5)]}
         )
 
         for config in validation_configs:
             name, cameras = config['name'], config['cameras']
             if cameras and len(cameras) > 0:
-                metrics = scene_metrics(iteration, name, cameras,
-                    scene, renderFunc, renderArgs)
-                wandb.log({f"test/l1_loss_{name}" : metrics[0],
-                           f"test/psnr_{name}" :  metrics[1],
-                           f"test/ssim_{name}" : metrics[2],
-                           f"test/LPIPS_{name}": metrics[3],
-                           f"time/inference_{name} [ms]": metrics[4]*1000
-                }, step=iteration)
-                if tb_writer:
-                    tb_writer.add_scalar(
-                        f'metrics_{name}/L1 Loss', metrics[0], iteration)
-                    tb_writer.add_scalar(
-                        f'metrics_{name}/PSNR', metrics[1], iteration)
-                    tb_writer.add_scalar(
-                        f'metrics_{name}/SSIM', metrics[2], iteration)
-                    tb_writer.add_scalar(
-                        f'metrics_{name}/LPIPS', metrics[3], iteration)
-                    tb_writer.add_scalar(
-                        f'metrics_{name}/FPS', metrics[4], iteration)
+                if is_final: # Calculate LPIPS at last iteration
+                    lpips_metrics = scene_metrics(iteration, name, cameras,
+                    scene, renderFunc, renderArgs, True)
+                    wandb.log({
+                        f"test/l1_loss_{name}":        lpips_metrics[0],
+                        f"test/psnr_{name}":           lpips_metrics[1],
+                        f"test/ssim_{name}":           lpips_metrics[2],
+                        f"test/lpips_{name}":          lpips_metrics[3],
+                        f"time/inference_{name} [ms]": lpips_metrics[4] * 1000,
+                    }, step=iteration)
+                else:
+                    metrics = scene_metrics(iteration, name, cameras,
+                        scene, renderFunc, renderArgs, False)
+                    wandb.log({
+                        f"test/l1_loss_{name}":        metrics[0],
+                        f"test/psnr_{name}":           metrics[1],
+                        f"test/ssim_{name}":           metrics[2],
+                        f"time/inference_{name} [ms]": metrics[3] * 1000,
+                    }, step=iteration)
+                    if tb_writer:
+                        tb_writer.add_scalar(f'metrics_{name}/L1 Loss', metrics[0], iteration)
+                        tb_writer.add_scalar(f'metrics_{name}/PSNR',    metrics[1], iteration)
+                        tb_writer.add_scalar(f'metrics_{name}/SSIM',    metrics[2], iteration)
+                        tb_writer.add_scalar(f'metrics_{name}/FPS',     metrics[3], iteration)
 
-    wandb_images = {}
+                # --- Wandb image logging for Testset (mirrors LiteGS) ---
+                if name == "Testset":
+                    logged_images = []
+                    num_log_images = 6
+                    log_indices = set(np.linspace(0, len(cameras) - 1, num_log_images, dtype=int).tolist())
+                    for batch_i, viewpoint in enumerate(cameras):
+                        if batch_i in log_indices:
+                            rendered = torch.clamp(
+                                renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
+                            gt = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                            rendered_np = rendered.permute(1, 2, 0).cpu().numpy()
+                            gt_np       = gt.permute(1, 2, 0).cpu().numpy()
+                            panel       = np.concatenate([rendered_np, gt_np], axis=1)
+                            panel_uint8 = (panel * 255).astype(np.uint8)
+                            logged_images.append(wandb.Image(
+                                panel_uint8,
+                                caption=f"iter {iteration} | Testset | frame {batch_i} | left: render  right: GT"
+                            ))
+                    wandb.log({"test/renders_Testset": logged_images}, step=iteration)
+                # ---------------------------------------------------------
 
-    if (iteration in visualize_iterations) and tb_writer:
-        validation_configs = (
-            {'name': 'Testset', 'cameras' : scene.getTestCameras()},
-            {'name': 'Trainingset', 'cameras' : [
-                scene.getTrainCameras()[idx % len(scene.getTrainCameras())]
-                for idx in range(5, 30, 5)] }
-        )
-        for config in validation_configs:
-            for viewpoint in config['cameras'][:5]:
-                image = torch.clamp(
-                    renderFunc(
-                        viewpoint, scene.gaussians, *renderArgs
-                    )["render"],
-                    0.0, 1.0)
-                gt_image = torch.clamp(
-                    viewpoint.original_image.to("cuda"),
-                    0.0, 1.0)
-
-                tb_writer.add_images(
-                    config['name'] + "_view_{}/render".format(
-                        viewpoint.image_name),
-                    image[None], global_step=iteration)
-                tb_writer.add_images(
-                    config['name'] + "_view_{}/ground_truth".format(
-                        viewpoint.image_name),
-                    gt_image[None], global_step=iteration)
+    # if (iteration in visualize_iterations) and tb_writer:
+    #     validation_configs = (
+    #         {'name': 'Testset',     'cameras': scene.getTestCameras()},
+    #         {'name': 'Trainingset', 'cameras': [
+    #             scene.getTrainCameras()[idx % len(scene.getTrainCameras())]
+    #             for idx in range(5, 30, 5)]}
+    #     )
+    #     for config in validation_configs:
+    #         for viewpoint in config['cameras'][:5]:
+    #             image = torch.clamp(
+    #                 renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"],
+    #                 0.0, 1.0)
+    #             gt_image = torch.clamp(
+    #                 viewpoint.original_image.to("cuda"),
+    #                 0.0, 1.0)
+    #             tb_writer.add_images(
+    #                 config['name'] + "_view_{}/render".format(viewpoint.image_name),
+    #                 image[None], global_step=iteration)
+    #             tb_writer.add_images(
+    #                 config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name),
+    #                 gt_image[None], global_step=iteration)
 
         torch.cuda.empty_cache()
 
@@ -379,8 +470,8 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=list(range(1000, 31000, 1000)))# 500 1000 1500 2000 2500 3000 3500 4000 4500 5000 5500 6000 6500 7000 7500 8000 8500 9000 9500 10000 ])
-    parser.add_argument("--visualize_iterations", nargs="+", type=int, default=list(range(1000, 31000, 1000)))
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=list(range(1000, 31000, 1000)))
+    parser.add_argument("--visualize_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])

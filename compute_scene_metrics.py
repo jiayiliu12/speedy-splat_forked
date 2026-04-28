@@ -67,11 +67,12 @@ def process_kernel_times(model_path, name, iteration, views, scene, renderFunc, 
         for k_t in kernel_times:
             writer.writerow(k_t)
 
-def scene_metrics(iteration, name, cameras, scene, renderFunc, renderArgs):
+def scene_metrics(iteration, name, cameras, scene, renderFunc, renderArgs, lpips_bool):
     l1_test = 0.0
     psnr_test = 0.0
     ssim_test = 0.0
-    lpips_test = 0.0
+    if lpips_bool:
+        lpips_test = 0.0
     render_time_test = 0.0
 
     pbar = tqdm(
@@ -89,7 +90,8 @@ def scene_metrics(iteration, name, cameras, scene, renderFunc, renderArgs):
         l1_test += l1_loss(image, gt_image).mean().double()
         psnr_test += psnr(image, gt_image).mean().double()
         ssim_test += ssim(image, gt_image).mean().double()
-        lpips_test += lpips(image, gt_image, net_type='vgg').mean().double()
+        if lpips_bool:
+            lpips_test += lpips(image, gt_image, net_type='vgg').mean().double()
         render_time_test += kernel_times[-1].item()
 
         pbar.update(1)
@@ -98,16 +100,24 @@ def scene_metrics(iteration, name, cameras, scene, renderFunc, renderArgs):
     l1_test /= len(cameras)
     psnr_test /= len(cameras)
     ssim_test /= len(cameras)
-    lpips_test /= len(cameras)
+    if lpips_bool:
+        lpips_test /= len(cameras)
     render_time_test /= len(cameras)
 
     fps_test = 1000 / render_time_test
 
-    print("\n[ITER {}] Evaluation {}: \n\t L1 {} \n\t PSNR {} \n\t SSIM {} \n\t LPIPS {} \n\t FPS {}".format(
-        iteration, name.capitalize(),
-        l1_test, psnr_test, ssim_test, lpips_test, fps_test))
+    if lpips_bool:
+        print("\n[ITER {}] Evaluation {}: \n\t L1 {} \n\t PSNR {} \n\t SSIM {} \n\t LPIPS {} \n\t FPS {}".format(
+            iteration, name.capitalize(),
+            l1_test, psnr_test, ssim_test, lpips_test, fps_test))
 
-    return l1_test, psnr_test, ssim_test, lpips_test, fps_test
+        return l1_test, psnr_test, ssim_test, lpips_test, fps_test 
+    
+    print("\n[ITER {}] Evaluation {}: \n\t L1 {} \n\t PSNR {} \n\t SSIM {} \n\t FPS {}".format( #\n\t LPIPS {}
+            iteration, name.capitalize(),
+            l1_test, psnr_test, ssim_test, fps_test)) #, lpips_test
+
+    return l1_test, psnr_test, ssim_test, fps_test # , lpips_test
 
 
 def compute_scene_metrics(model_path, name, iteration, views, scene, renderFunc, renderArgs):
@@ -116,7 +126,7 @@ def compute_scene_metrics(model_path, name, iteration, views, scene, renderFunc,
     makedirs(output_path, exist_ok=True)
 
     metrics_pkg = scene_metrics(iteration, name, views, scene,
-                                renderFunc, renderArgs)
+                                renderFunc, renderArgs, True)
     l1, psnr, ssim, lpips, fps = metrics_pkg
     l1 = l1.item() if isinstance(l1, torch.Tensor) else l1
     psnr = psnr.item() if isinstance(psnr, torch.Tensor) else psnr

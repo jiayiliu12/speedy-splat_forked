@@ -1,7 +1,7 @@
-data_path="/users/ljiayi/data/truck"
-model_path="/users/ljiayi/speedy-splat_forked/output/wandb_truck_new_pruning"
+data_path="capstor/scratch/cscs/ljiayi/data/truck"
+model_path="~/gaussian-splatting-implementations/speedy-splat_forked/output/wandb_truck"
 
-python /users/ljiayi/speedy-splat_forked/train.py \
+python ~/gaussian-splatting-implementations/speedy-splat_forked/train.py \
   -s ${data_path} \
   -m ${model_path} \
   --eval \
