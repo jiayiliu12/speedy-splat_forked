@@ -119,12 +119,15 @@ def training(dataset, opt, pipe, testing_iterations, visualize_iterations, savin
     _WARMUP_ITERS = min(100, max(10, opt.iterations // 300))
     _all_iter_ms: list[float] = []
     _all_densify_ms: list[float] = []
+    _all_rend_ms: list[float] = []
     # ------------------------------------------------
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
+    # get the mean, median, and std of the rendering of the last epoch! This is the inference speed??
+    last_epoch_first_iter = opt.iterations - len(scene.getTrainCameras())
 
     for iteration in range(first_iter, opt.iterations + 1):
         if network_gui.conn == None:
@@ -218,6 +221,10 @@ def training(dataset, opt, pipe, testing_iterations, visualize_iterations, savin
             time_bwd = start_backward.elapsed_time(end_backward)
             train_time_ms += time
             _all_iter_ms.append(time)
+            if iteration >= last_epoch_first_iter:
+                if iteration == last_epoch_first_iter:
+                    print("Start logging render time! We are at the last epoch.")
+                _all_rend_ms.append(time_render)
 
             # 4. Log pure training metrics — densification has NOT run yet,
             #    so these numbers reflect only the actual training kernel.
@@ -303,6 +310,11 @@ def training(dataset, opt, pipe, testing_iterations, visualize_iterations, savin
         if len(_all_iter_ms) > _WARMUP_ITERS
         else np.array(_all_iter_ms)
     )
+    _bench_rend = (
+        np.array(_all_rend_ms[_WARMUP_ITERS:])
+        if len(_all_rend_ms) > _WARMUP_ITERS
+        else np.array(_all_rend_ms)
+    )
     _densify_arr = np.array(_all_densify_ms) if _all_densify_ms else np.zeros(1)
     _total_iter_s    = np.array(_all_iter_ms).sum() / 1000
     _total_densify_s = _densify_arr.sum() / 1000
@@ -312,6 +324,9 @@ def training(dataset, opt, pipe, testing_iterations, visualize_iterations, savin
         "benchmark/iter_mean_ms":         float(np.mean(_bench_iters)),
         "benchmark/iter_median_ms":       float(np.median(_bench_iters)),
         "benchmark/iter_std_ms":          float(np.std(_bench_iters)),
+        "benchmark/final_epoch_render_mean_ms":         float(np.mean(_bench_rend)),
+        "benchmark/final_epoch_render_median_ms":       float(np.median(_bench_rend)),
+        "benchmark/final_epoch_render_std_ms":          float(np.std(_bench_rend)),
         "benchmark/densify_mean_ms":      float(np.mean(_densify_arr)),
         "benchmark/densify_total_s":      round(_total_densify_s, 3),
         "benchmark/total_training_s":     round(_total_iter_s, 3),
