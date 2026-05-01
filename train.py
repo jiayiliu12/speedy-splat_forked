@@ -80,7 +80,7 @@ def prune(scene, gaussians, pipe, background, prune_ratio):
         "time_ms" : pruning_time_ms
     }
 
-def training(dataset, opt, pipe, testing_iterations, visualize_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def training(dataset, opt, pipe, testing_epochs, visualize_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     
@@ -95,8 +95,8 @@ def training(dataset, opt, pipe, testing_iterations, visualize_iterations, savin
     end_render = torch.cuda.Event(enable_timing=True)
     start_backward = torch.cuda.Event(enable_timing=True)
     end_backward = torch.cuda.Event(enable_timing=True)
-    start_dens = torch.cuda.Event(enable_timing=True)
-    end_dens = torch.cuda.Event(enable_timing=True)
+    start_dens_and_prune = torch.cuda.Event(enable_timing=True)
+    end_dens_and_prune = torch.cuda.Event(enable_timing=True)
 
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
@@ -119,10 +119,22 @@ def training(dataset, opt, pipe, testing_iterations, visualize_iterations, savin
     _WARMUP_ITERS = min(100, max(10, opt.iterations // 300))
     _all_iter_ms: list[float] = []
     _all_densify_ms: list[float] = []
+    _all_rend_ms: list[float] = []
     # ------------------------------------------------
 
     viewpoint_stack = None
+    num_train_cameras = len(scene.getTrainCameras())
     ema_loss_for_log = 0.0
+    _epoch_loss_sum = 0.0
+    _epoch_l1_sum = 0.0
+    _epoch_render_ms_sum = 0.0
+    _epoch_bwd_ms_sum = 0.0
+    _epoch_iter_ms_sum = 0.0
+    _epoch_dens_and_prune_ms_sum = 0.0
+    _epoch_whole_ms_sum = 0.0
+    _epoch_n = 0
+    # get the mean, median, and std of the rendering of the last epoch! This is the inference speed??
+    last_epoch_first_iter = opt.iterations / len(scene.getTrainCameras())
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
 
@@ -218,31 +230,31 @@ def training(dataset, opt, pipe, testing_iterations, visualize_iterations, savin
             time_bwd = start_backward.elapsed_time(end_backward)
             train_time_ms += time
             _all_iter_ms.append(time)
+            if iteration >= last_epoch_first_iter:
+                _all_rend_ms.append(time_render)
 
-            # 4. Log pure training metrics — densification has NOT run yet,
-            #    so these numbers reflect only the actual training kernel.
-            wandb.log({
-                "train/total_loss": loss.item(),
-                "train/L1": Ll1.item(),
-                "gaussians/count": scene.gaussians.get_xyz.shape[0],
-                "time/render [ms]": time_render,
-                "time/backward [ms]": time_bwd,
-                "time/total_iteration [ms]": time,
-                "time/train_accumulated [ms]": train_time_ms,
-            }, iteration)
+            epoch = (iteration - 1) // num_train_cameras
+            is_epoch_end = (iteration % num_train_cameras == 0) or (iteration == opt.iterations)
+
+            _epoch_loss_sum += loss.item()
+            _epoch_l1_sum += Ll1.item()
+            _epoch_render_ms_sum += time_render
+            _epoch_bwd_ms_sum += time_bwd
+            _epoch_iter_ms_sum += time
+            _epoch_n += 1
 
             # 5. Evaluation / visualisation — before densification (mirrors LiteGS)
             training_report(
-                tb_writer, iteration,
+                tb_writer, iteration, epoch,
                 train_time_ms,
-                testing_iterations, visualize_iterations,
+                testing_epochs, visualize_iterations,
                 scene, render, (pipe, background), is_final=(iteration == opt.iterations))
 
             # 6. Densification + pruning
             prune_time_ms = 0
 
             if iteration < opt.densify_until_iter:
-                start_dens.record()
+                start_dens_and_prune.record()
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
@@ -250,7 +262,6 @@ def training(dataset, opt, pipe, testing_iterations, visualize_iterations, savin
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
-                end_dens.record()
 
                 # --- Soft Pruning ---
                 if (iteration >= opt.prune_from_iter) and \
@@ -281,27 +292,51 @@ def training(dataset, opt, pipe, testing_iterations, visualize_iterations, savin
                 prune_peak_memory_reserved = prune_pkg['peak_memory_reserved']
 
             # end_whole covers the full iteration including densification
+            end_dens_and_prune.record()
             end_whole.record()
             end_whole.synchronize()
 
-            # 7. Densification timing logged separately — training metrics above
-            #    are already committed and stay uncontaminated.
+            # 7. Accumulate densification timings; flush everything per epoch.
             time_whole = start_whole.elapsed_time(end_whole)
-            time_dens = start_dens.elapsed_time(end_dens) + prune_time_ms
+            time_dens_and_prune = start_dens_and_prune.elapsed_time(end_dens_and_prune)
 
-            if time_dens > 0:
-                _all_densify_ms.append(time_dens)
+            if time_dens_and_prune > 0:
+                _all_densify_ms.append(time_dens_and_prune)
 
-            wandb.log({
-                "time/densification_pruning [ms]": time_dens,
-                "time/total_iteration_with_pruning [ms]": time_whole,
-            }, iteration)
+            _epoch_dens_and_prune_ms_sum += time_dens_and_prune
+            _epoch_whole_ms_sum += time_whole
+
+            if is_epoch_end:
+                wandb.log({
+                    "train/total_loss":                       _epoch_loss_sum / _epoch_n,
+                    "train/L1":                               _epoch_l1_sum / _epoch_n,
+                    "gaussians/count":                        scene.gaussians.get_xyz.shape[0],
+                    "time/render [ms]":                       _epoch_render_ms_sum / _epoch_n,
+                    "time/backward [ms]":                     _epoch_bwd_ms_sum / _epoch_n,
+                    "time/total_iteration [ms]":              _epoch_iter_ms_sum / _epoch_n,
+                    "time/train_accumulated [ms]":            train_time_ms,
+                    "time/densification_pruning [ms]":        _epoch_dens_and_prune_ms_sum / _epoch_n,
+                    "time/total_iteration_with_pruning [ms]": _epoch_whole_ms_sum / _epoch_n,
+                }, epoch)
+                _epoch_loss_sum = 0.0
+                _epoch_l1_sum = 0.0
+                _epoch_render_ms_sum = 0.0
+                _epoch_bwd_ms_sum = 0.0
+                _epoch_iter_ms_sum = 0.0
+                _epoch_dens_and_prune_ms_sum = 0.0
+                _epoch_whole_ms_sum = 0.0
+                _epoch_n = 0
 
     # --- Benchmark Summary (mirrors LiteGS) ---
     _bench_iters = (
         np.array(_all_iter_ms[_WARMUP_ITERS:])
         if len(_all_iter_ms) > _WARMUP_ITERS
         else np.array(_all_iter_ms)
+    )
+    _bench_rend = (
+        np.array(_all_rend_ms[_WARMUP_ITERS:])
+        if len(_all_rend_ms) > _WARMUP_ITERS
+        else np.array(_all_rend_ms)
     )
     _densify_arr = np.array(_all_densify_ms) if _all_densify_ms else np.zeros(1)
     _total_iter_s    = np.array(_all_iter_ms).sum() / 1000
@@ -316,6 +351,9 @@ def training(dataset, opt, pipe, testing_iterations, visualize_iterations, savin
         "benchmark/densify_total_s":      round(_total_densify_s, 3),
         "benchmark/total_training_s":     round(_total_iter_s, 3),
         "benchmark/total_with_densify_s": round(_total_iter_s + _total_densify_s, 3),
+        "benchmark/final_epoch_render_mean_ms":         float(np.mean(_bench_rend)),
+        "benchmark/final_epoch_render_median_ms":       float(np.median(_bench_rend)),
+        "benchmark/final_epoch_render_std_ms":          float(np.std(_bench_rend)),
     }
     wandb.log({
         **_bench_scalars,
@@ -363,9 +401,9 @@ def prepare_output_and_logger(args):
 
 
 def training_report(
-        tb_writer, iteration,
+        tb_writer, iteration, epoch,
         train_time_ms,
-        testing_iterations, visualize_iterations,
+        testing_epochs, visualize_iterations,
         scene: Scene, renderFunc, renderArgs, is_final):
     """Evaluate on test/train cameras and log quality metrics.
 
@@ -374,10 +412,10 @@ def training_report(
     function's output uncontaminated by densification overhead.
     """
 
-    if iteration in testing_iterations:
+    if epoch in testing_epochs:
         torch.cuda.empty_cache()
-        print("\n[ITER {}] Training Time: {:.1f} minutes".format(
-            iteration, train_time_ms / 60_000))
+        print("\n[EPOCH {}] Training Time: {:.1f} minutes".format(
+            epoch, train_time_ms / 60_000))
 
         validation_configs = (
             {'name': 'Testset',     'cameras': scene.getTestCameras()},
@@ -398,7 +436,7 @@ def training_report(
                         f"test/ssim_{name}":           lpips_metrics[2],
                         f"test/lpips_{name}":          lpips_metrics[3],
                         f"time/inference_{name} [ms]": lpips_metrics[4] * 1000,
-                    }, step=iteration)
+                    }, step=epoch)
                 else:
                     metrics = scene_metrics(iteration, name, cameras,
                         scene, renderFunc, renderArgs, False)
@@ -407,12 +445,7 @@ def training_report(
                         f"test/psnr_{name}":           metrics[1],
                         f"test/ssim_{name}":           metrics[2],
                         f"time/inference_{name} [ms]": metrics[3] * 1000,
-                    }, step=iteration)
-                    if tb_writer:
-                        tb_writer.add_scalar(f'metrics_{name}/L1 Loss', metrics[0], iteration)
-                        tb_writer.add_scalar(f'metrics_{name}/PSNR',    metrics[1], iteration)
-                        tb_writer.add_scalar(f'metrics_{name}/SSIM',    metrics[2], iteration)
-                        tb_writer.add_scalar(f'metrics_{name}/FPS',     metrics[3], iteration)
+                    }, step=epoch)
 
                 # --- Wandb image logging for Testset (mirrors LiteGS) ---
                 if name == "Testset":
@@ -432,7 +465,7 @@ def training_report(
                                 panel_uint8,
                                 caption=f"iter {iteration} | Testset | frame {batch_i} | left: render  right: GT"
                             ))
-                    wandb.log({"test/renders_Testset": logged_images}, step=iteration)
+                    wandb.log({"test/renders_Testset": logged_images}, step=epoch)
                 # ---------------------------------------------------------
 
     # if (iteration in visualize_iterations) and tb_writer:
@@ -470,7 +503,7 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=list(range(1000, 31000, 1000)))
+    parser.add_argument("--test_epochs", nargs="+", type=int, default=list(range(10,210,10)))
     parser.add_argument("--visualize_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[30_000])
     parser.add_argument("--quiet", action="store_true")
@@ -487,7 +520,7 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.visualize_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_epochs, args.visualize_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
 
     # All done
     print("\nTraining complete.")
